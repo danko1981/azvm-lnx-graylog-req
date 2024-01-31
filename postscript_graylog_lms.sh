@@ -6,9 +6,10 @@ if [ "$EUID" -ne 0 ];then
 fi
 passw="$1"
 if [ -z "$passw" ]; then
-        echo "No admin password init, use default."
+        echo "No admin password init, use default (admin)."
+        passw="admin"
 else
-        echo "$passw is the Admin password"
+        echo "$passw is the Admin password."
 fi
 echo "[+] Seeting needrestart to automatic to prevent restart pop ups"
 sudo sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
