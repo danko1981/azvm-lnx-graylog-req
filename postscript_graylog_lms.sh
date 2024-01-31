@@ -1,5 +1,5 @@
 #!/bin/bash
-
+$passw = $1
 echo "[+] Checking for root permissions"
 if [ "$EUID" -ne 0 ];then
     echo "Please run this script as root"
@@ -143,12 +143,17 @@ dpkg -i graylog-5.0-repository_latest.deb
 apt-get update && sudo apt-get install graylog-server -y
 
 SECRET=`pwgen -N 1 -s 96`
-echo -n "Enter Admin wenb interface Password: "
-read passwd
-ADMIN=`echo $passwd| tr -d '\n' | sha256sum | cut -d" " -f1`
-echo "Generated password salt is " $secret
-echo "Genberated admin hash is " $admin
-
+if [[ -z $passw ]]; then
+    echo -n "Enter Admin wenb interface Password: "
+    read passw
+    ADMIN=`echo $passw| tr -d '\n' | sha256sum | cut -d" " -f1`
+    echo "Generated password salt is " $secret
+    echo "Genberated admin hash is " $admin
+else
+    ADMIN=`echo $passw| tr -d '\n' | sha256sum | cut -d" " -f1`
+    echo "Generated password salt is " $secret
+    echo "Genberated admin hash is " $admin
+fi
 echo "[+] Adjusting Graylog Server configuration file"
 CONFIGSECRET=`echo "password_secret = "$SECRET`
 CONFIGADMIN=`echo "root_password_sha2 = "$ADMIN`
