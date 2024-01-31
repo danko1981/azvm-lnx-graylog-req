@@ -1,5 +1,5 @@
 #!/bin/bash
-PASSW=$1
+passw=$1
 echo "[+] Checking for root permissions"
 if [ "$EUID" -ne 0 ];then
     echo "Please run this script as root"
