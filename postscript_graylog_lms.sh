@@ -1,11 +1,15 @@
 #!/bin/bash
-passw=$1
 echo "[+] Checking for root permissions"
 if [ "$EUID" -ne 0 ];then
     echo "Please run this script as root"
     exit 1
 fi
-
+passw=$1
+if [ -z "$passw" ]; then
+        echo "No admin password init, use default."
+else
+        echo "$passw is the Admin password"
+fi
 echo "[+] Seeting needrestart to automatic to prevent restart pop ups"
 sudo sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
 
@@ -143,7 +147,7 @@ dpkg -i graylog-5.0-repository_latest.deb
 apt-get update && sudo apt-get install graylog-server -y
 
 SECRET=`pwgen -N 1 -s 96`
-if [[ -z "$passw" ]]; then
+if [ -z "$passw" ]; then
     echo -n "Enter Admin wenb interface Password: "
     read passw
     ADMIN=`echo $passw| tr -d '\n' | sha256sum | cut -d" " -f1`
