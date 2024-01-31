@@ -146,24 +146,24 @@ wget https://packages.graylog2.org/repo/packages/graylog-5.0-repository_latest.d
 dpkg -i graylog-5.0-repository_latest.deb
 apt-get update && sudo apt-get install graylog-server -y
 
-SECRET=`pwgen -N 1 -s 96`
-if [ -z "$passw" ]; then
-    echo -n "Enter Admin wenb interface Password: "
-    read passw
-    ADMIN=`echo $passw| tr -d '\n' | sha256sum | cut -d" " -f1`
-    echo "Generated password salt is " $secret
-    echo "Genberated admin hash is " $admin
-else
-    ADMIN=`echo $passw| tr -d '\n' | sha256sum | cut -d" " -f1`
-    echo "Generated password salt is " $secret
-    echo "Genberated admin hash is " $admin
-fi
+#SECRET=`pwgen -N 1 -s 96`
+#if [ -z "$passw" ]; then
+#    echo -n "Enter Admin wenb interface Password: "
+#    read passw
+#    ADMIN=`echo $passw| tr -d '\n' | sha256sum | cut -d" " -f1`
+#    echo "Generated password salt is " $secret
+#    echo "Genberated admin hash is " $admin
+#else
+#    ADMIN=`echo $passw| tr -d '\n' | sha256sum | cut -d" " -f1`
+#    echo "Generated password salt is " $secret
+#    echo "Genberated admin hash is " $admin
+#fi
 echo "[+] Adjusting Graylog Server configuration file"
-CONFIGSECRET=`echo "password_secret = "$SECRET`
-CONFIGADMIN=`echo "root_password_sha2 = "$ADMIN`
-echo "[+] replacing in configuration files"
-sed -r "s/password_secret =/${CONFIGSECRET}/g" -i /etc/graylog/server/server.conf
-sed -r "s/root_password_sha2 =/${CONFIGADMIN}/g" -i /etc/graylog/server/server.conf
+#CONFIGSECRET=`echo "password_secret = "$SECRET`
+#CONFIGADMIN=`echo "root_password_sha2 = "$ADMIN`
+#echo "[+] replacing in configuration files"
+#sed -r "s/password_secret =/${CONFIGSECRET}/g" -i /etc/graylog/server/server.conf
+#sed -r "s/root_password_sha2 =/${CONFIGADMIN}/g" -i /etc/graylog/server/server.conf
 sed -i 's/#http_bind_address = 127.0.0.1:9000/http_bind_address = 0.0.0.0:9000/g' /etc/graylog/server/server.conf
 
 echo "[+] Disabling Gralog version checks"
