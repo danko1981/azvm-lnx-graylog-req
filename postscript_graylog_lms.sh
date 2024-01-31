@@ -143,7 +143,7 @@ dpkg -i graylog-5.0-repository_latest.deb
 apt-get update && sudo apt-get install graylog-server -y
 
 SECRET=`pwgen -N 1 -s 96`
-if [[ -z $passw ]]; then
+if [[ -z "$passw" ]]; then
     echo -n "Enter Admin wenb interface Password: "
     read passw
     ADMIN=`echo $passw| tr -d '\n' | sha256sum | cut -d" " -f1`
