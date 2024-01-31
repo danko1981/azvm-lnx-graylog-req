@@ -4,7 +4,7 @@ if [ "$EUID" -ne 0 ];then
     echo "Please run this script as root"
     exit 1
 fi
-passw=$1
+passw="$1"
 if [ -z "$passw" ]; then
         echo "No admin password init, use default."
 else
