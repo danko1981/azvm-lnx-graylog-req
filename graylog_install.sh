@@ -282,6 +282,27 @@ dump_brief_logs() {
   grep -iE 'preflight|temporary|credential|username|password' /var/log/graylog-server/server.log 2>/dev/null | tail -n 40 || true
 }
 
+show_preflight_credentials() {
+  echo
+  echo "================ Preflight credentials (if present) ================"
+  if [[ -f /var/log/graylog-server/server.log ]]; then
+    # Print the latest relevant lines that typically include username/password for the preflight wizard
+    tail -n 300 /var/log/graylog-server/server.log \
+      | grep -iE 'preflight|temporary|credential|username|password' \
+      | tail -n 60 || true
+
+    # Also try journalctl in case log file didn’t flush yet
+    echo "----- journalctl graylog-server (filtered tail) -----"
+    journalctl -u graylog-server -n 200 --no-pager 2>/dev/null \
+      | grep -iE 'preflight|temporary|credential|username|password' \
+      | tail -n 60 || true
+  else
+    echo "server.log not found at /var/log/graylog-server/server.log"
+  fi
+  echo "===================================================================="
+  echo
+}
+
 # ---------------- Execute ----------------
 if [[ "$PM" == "apt" ]]; then
   log "Using APT flow"
@@ -329,13 +350,16 @@ cat <<EOF
 
  Notes:
  - If a browser Basic-Auth pops up on first visit, use the temporary
-   preflight credentials from server.log, finish the wizard, then
-   log in with admin/admin.
+   preflight credentials printed below (and in server.log), finish the
+   wizard, then log in with admin/admin.
  - If :9200 didn't come up in time, Data Node may still be initialising.
    Check log tails above in ${LOG_FILE}.
 =========================================================
 
 EOF
+
+# NEW: print preflight credentials (best-effort)
+show_preflight_credentials
 
 # Always exit 0 for Terraform
 exit 0
