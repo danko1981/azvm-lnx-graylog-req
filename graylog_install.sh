@@ -1,365 +1,341 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Graylog (Server + Data Node) + MongoDB installer/upgrader
+# Ubuntu 22.04/24.04 or RHEL 8/9
+# Terraform-friendly: logs to /var/log/server_install.log and ALWAYS exits 0
 
-# =========================
-# Graylog one-shot installer/upgrader
-#  - Ubuntu 22.04/24.04 (apt)
-#  - RHEL 8/9 (dnf)
-# Components:
-#    - MongoDB (official repo)
-#    - Graylog Data Node (bundles/controls OpenSearch)
-#    - Graylog Server
-# =========================
+set -uo pipefail
 
-# ---------- Helpers ----------
-log()  { echo -e "\e[1;32m[+]\e[0m $*"; }
+# ---------------- Logging ----------------
+LOG_FILE="/var/log/server_install.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+chmod 0644 "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+ERROR_COUNT=0
 warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
-err()  { echo -e "\e[1;31m[x]\e[0m $*" >&2; }
-need() { command -v "$1" >/dev/null 2>&1 || { err "Missing required command: $1"; exit 1; }; }
-
-need curl
-need sed
-need tee
-need sysctl
+log()  { echo -e "\e[1;32m[+]\e[0m $*"; }
+err()  { echo -e "\e[1;31m[x]\e[0m $*"; }
+run()  { "$@" || { warn "Command failed (ignored): $*"; ERROR_COUNT=$((ERROR_COUNT+1)); return 0; }; }
 
 if [[ $EUID -ne 0 ]]; then
-  err "Please run as root (use sudo)."
-  exit 1
+  err "This script should run as root. Continuing, but operations may fail."
+  ERROR_COUNT=$((ERROR_COUNT+1))
 fi
 
-source /etc/os-release
+# ---------------- Detect OS ----------------
+source /etc/os-release 2>/dev/null || true
 ID_LIKE="${ID_LIKE:-}"
-OS="$ID"
-VER_ID="$VERSION_ID"
+OS="${ID:-unknown}"
+VER_ID="${VERSION_ID:-unknown}"
+log "Detected OS: ${PRETTY_NAME:-$OS $VER_ID}"
 
-log "Detected OS: $PRETTY_NAME"
-
-# Decide package manager family
-if [[ "$ID" == "ubuntu" ]] || [[ "$ID_LIKE" == *"debian"* ]]; then
-  PM="apt"
-elif [[ "$ID" == "rhel" ]] || [[ "$ID_LIKE" == *"rhel"* ]] || [[ "$ID_LIKE" == *"fedora"* ]] || [[ "$ID_LIKE" == *"centos"* ]]; then
+if [[ "$OS" == "ubuntu" ]] || [[ "$ID_LIKE" == *"debian"* ]]; then
+  PM="apt"; export DEBIAN_FRONTEND=noninteractive
+elif [[ "$OS" == "rhel" ]] || [[ "$ID_LIKE" == *"rhel"* ]] || [[ "$ID_LIKE" == *"fedora"* ]] || [[ "$ID_LIKE" == *"centos"* ]]; then
   PM="dnf"
 else
-  err "Unsupported distribution: $PRETTY_NAME"
-  exit 2
+  warn "Unsupported distribution: ${PRETTY_NAME:-$OS}. Trying APT path."
+  PM="apt"; export DEBIAN_FRONTEND=noninteractive
 fi
 
-# ---------- Common variables ----------
-GL_REPO_BASENAME_DEB="https://packages.graylog2.org/repo/packages"
-GL_REPO_BASENAME_RPM="https://packages.graylog2.org/repo/packages"
-# Try latest major first, then fall back
-GL_MAJORS=(6.1 6.0 5.2 5.1 5.0)
-
+# ---------------- Constants ----------------
+GL_REPO_BASE="https://packages.graylog2.org/repo/packages"
+GL_MAJORS=(6.3 6.2 6.1 6.0 5.2 5.1 5.0)     # try newest first
 MONGO_MAJOR_UBU="8.0"
-MONGO_MAJOR_RHEL="8.0"    # falls back to 7.0 if unavailable
+MONGO_MAJOR_RHEL="8.0"                       # fallback to 7.0 if needed
+ADMIN_SHA256="$(printf '%s' admin | sha256sum | awk '{print $1}')"
+SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
 
-ADMIN_PLAIN="admin"
-ADMIN_SHA256="$(printf '%s' "$ADMIN_PLAIN" | sha256sum | awk '{print $1}')"
-PASSWORD_SECRET="$(openssl rand -base64 96 | tr -d '\n' || true)"
-[[ -n "$PASSWORD_SECRET" ]] || PASSWORD_SECRET="$(head -c 96 /dev/urandom | base64 | tr -d '\n')"
-
-# ---------- Functions per family ----------
-
-set_kernel_params() {
-  log "Ensuring kernel parameters are set for OpenSearch..."
-  local MAX_MAP_COUNT="262144"
-  # Set for the current session
-  sysctl -w vm.max_map_count=$MAX_MAP_COUNT
-  # Make it permanent
-  echo "vm.max_map_count=$MAX_MAP_COUNT" > /etc/sysctl.d/99-graylog.conf
-  sysctl -p /etc/sysctl.d/99-graylog.conf
+# ---------------- Helpers ----------------
+file_set_kv() {
+  # file_set_kv <file> <key> <value>   (robust, no blank writes)
+  local f="$1" k="$2" v="$3"
+  if [[ ! -f "$f" ]]; then : > "$f"; fi
+  if grep -qE "^[[:space:]#]*${k}[[:space:]]*=" "$f" 2>/dev/null; then
+    awk -v k="$k" -v v="$v" '
+      BEGIN{ FS="="; OFS=" = " }
+      $0 ~ "^[[:space:]#]*"k"[[:space:]]*=" { print k, v; next }
+      { print }
+    ' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+  else
+    printf "%s = %s\n" "$k" "$v" >> "$f"
+  fi
 }
 
+get_host_ip() {
+  local ip
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')" || true
+  [[ -z "$ip" ]] && ip="$(ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+  [[ -z "$ip" ]] && ip="127.0.0.1"
+  echo "$ip"
+}
+
+# ---------------- Repos ----------------
 add_graylog_repo_apt() {
   for ver in "${GL_MAJORS[@]}"; do
-    pkg="graylog-${ver}-repository_latest.deb"
-    url="${GL_REPO_BASENAME_DEB}/${pkg}"
+    local pkg="graylog-${ver}-repository_latest.deb"
+    local url="${GL_REPO_BASE}/${pkg}"
     if curl -fsIL "$url" >/dev/null 2>&1; then
       log "Adding Graylog APT repo ($ver)"
-      curl -fsSL "$url" -o "/tmp/${pkg}"
-      dpkg -i "/tmp/${pkg}"
+      run curl -fsSL "$url" -o "/tmp/${pkg}"
+      run dpkg -i "/tmp/${pkg}"
       return 0
     fi
   done
-  err "Could not resolve a Graylog APT repository package."
-  exit 3
+  warn "No Graylog APT repo package found."
+  ERROR_COUNT=$((ERROR_COUNT+1))
 }
 
 add_graylog_repo_rpm() {
   for ver in "${GL_MAJORS[@]}"; do
-    pkg="graylog-${ver}-repository_latest.rpm"
-    url="${GL_REPO_BASENAME_RPM}/${pkg}"
+    local pkg="graylog-${ver}-repository_latest.rpm"
+    local url="${GL_REPO_BASE}/${pkg}"
     if curl -fsIL "$url" >/dev/null 2>&1; then
       log "Adding Graylog RPM repo ($ver)"
-      rpm -Uvh "$url"
+      run rpm -Uvh "$url"
       return 0
     fi
   done
-  err "Could not resolve a Graylog RPM repository package."
-  exit 3
+  warn "No Graylog RPM repo package found."
+  ERROR_COUNT=$((ERROR_COUNT+1))
 }
 
+# ---------------- MongoDB ----------------
 install_mongodb_apt() {
-  log "Adding MongoDB ${MONGO_MAJOR_UBU} APT repo"
-  apt-get update -y
-  apt-get install -y gnupg curl ca-certificates
-  curl -fsSL "https://www.mongodb.org/static/pgp/server-${MONGO_MAJOR_UBU}.asc" \
-    | gpg --dearmor -o /usr/share/keyrings/mongodb-server-${MONGO_MAJOR_UBU}.gpg
-  UB_CODENAME=$(. /etc/os-release; echo "$VERSION_CODENAME")
-  echo "deb [signed-by=/usr/share/keyrings/mongodb-server-${MONGO_MAJOR_UBU}.gpg] https://repo.mongodb.org/apt/ubuntu ${UB_CODENAME}/mongodb-org/${MONGO_MAJOR_UBU} multiverse" \
-    | tee /etc/apt/sources.list.d/mongodb-org-${MONGO_MAJOR_UBU}.list >/dev/null
-  apt-get update -y
-  log "Installing MongoDB..."
-  apt-get install -y mongodb-org
-  systemctl enable --now mongod
+  log "Installing MongoDB ${MONGO_MAJOR_UBU} (Ubuntu)"
+  run apt-get update -y
+  run apt-get install -y gnupg curl ca-certificates lsb-release
+  run bash -c "curl -fsSL https://www.mongodb.org/static/pgp/server-${MONGO_MAJOR_UBU}.asc \
+       | gpg --dearmor -o /usr/share/keyrings/mongodb-server-${MONGO_MAJOR_UBU}.gpg"
+  local codename; codename=$(. /etc/os-release; echo "$VERSION_CODENAME")
+  echo "deb [signed-by=/usr/share/keyrings/mongodb-server-${MONGO_MAJOR_UBU}.gpg] https://repo.mongodb.org/apt/ubuntu ${codename}/mongodb-org/${MONGO_MAJOR_UBU} multiverse" \
+    > /etc/apt/sources.list.d/mongodb-org-${MONGO_MAJOR_UBU}.list
+  run apt-get update -y
+  run apt-get install -y mongodb-org
+  run systemctl enable --now mongod
 }
 
 install_mongodb_rpm() {
-  local major="$MONGO_MAJOR_RHEL"
-  log "Adding MongoDB ${major} YUM repo"
-  cat >/etc/yum.repos.d/mongodb-org-${major}.repo <<EOF
-[mongodb-org-${major}]
+  log "Installing MongoDB ${MONGO_MAJOR_RHEL} (RHEL)"
+  cat >/etc/yum.repos.d/mongodb-org-${MONGO_MAJOR_RHEL}.repo <<EOF
+[mongodb-org-${MONGO_MAJOR_RHEL}]
 name=MongoDB Repository
-baseurl=https://repo.mongodb.org/yum/redhat/\$releasever/mongodb-org/${major}/x86_64/
+baseurl=https://repo.mongodb.org/yum/redhat/\$releasever/mongodb-org/${MONGO_MAJOR_RHEL}/x86_64/
 gpgcheck=1
 enabled=1
-gpgkey=https://www.mongodb.org/static/pgp/server-${major}.asc
+gpgkey=https://www.mongodb.org/static/pgp/server-${MONGO_MAJOR_RHEL}.asc
 EOF
-  log "Installing MongoDB..."
   if ! dnf -y install mongodb-org; then
-    warn "Falling back to MongoDB 7.0 repo…"
-    major="7.0"
-    sed -i "s/${MONGO_MAJOR_RHEL}/${major}/g" /etc/yum.repos.d/mongodb-org-*.repo
-    dnf clean all -y || true
-    dnf -y install mongodb-org
+    warn "Falling back to MongoDB 7.0"
+    sed -i "s/${MONGO_MAJOR_RHEL}/7.0/g" /etc/yum.repos.d/mongodb-org-*.repo
+    run dnf clean all -y
+    run dnf -y install mongodb-org
   fi
-  systemctl enable --now mongod
+  run systemctl enable --now mongod
 }
 
+# ---------------- Graylog packages ----------------
 install_graylog_stack_apt() {
   add_graylog_repo_apt
-  apt-get update -y
-  log "Installing Java 17 (required for Graylog 6+)"
-  apt-get install -y openjdk-17-jre-headless || { err "Failed to install Java 17. Graylog 6+ requires it."; exit 4; }
-  log "Installing Graylog Data Node and Server..."
-  apt-get install -y graylog-datanode graylog-server
+  run apt-get update -y
+  run apt-get install -y openjdk-17-jre-headless || run apt-get install -y openjdk-11-jre-headless
+  run apt-get install -y graylog-datanode graylog-server
 }
 
 install_graylog_stack_rpm() {
   add_graylog_repo_rpm
-  log "Installing Java 17 (required for Graylog 6+)"
-  dnf -y install java-17-openjdk || { err "Failed to install Java 17. Graylog 6+ requires it."; exit 4; }
-  log "Installing Graylog Data Node and Server..."
-  dnf -y install graylog-datanode graylog-server
+  run dnf -y install java-17-openjdk || run dnf -y install java-11-openjdk
+  run dnf -y install graylog-datanode graylog-server
 }
 
-cleanup_previous_install() {
-  log "Cleaning up previous installation attempt to ensure a fresh start..."
-  # Stop services in case they are running from a previous attempt
-  systemctl stop graylog-server graylog-datanode >/dev/null 2>&1 || true
+# ---------------- Graylog Server config ----------------
+PASSWORD_SECRET=""
+configure_graylog_server() {
+  local conf="/etc/graylog/server/server.conf"
+  log "Configuring graylog-server: $conf"
+  mkdir -p /etc/graylog/server
+  [[ -f "$conf" ]] || run cp /usr/share/graylog-server/server.conf "$conf"
 
-  # Remove old configuration and data directories
-  rm -rf /etc/graylog/
-  rm -rf /var/lib/graylog-datanode/
-  log "Cleanup complete."
+  # Derive or generate a non-blank shared secret
+  PASSWORD_SECRET="$(awk -F= '/^[[:space:]]*password_secret[[:space:]]*=/{s=$2} END{gsub(/^[ \t]+|[ \t]+$/, "", s); print s}' "$conf" 2>/dev/null || true)"
+  if [[ -z "$PASSWORD_SECRET" ]]; then
+    if command -v openssl >/dev/null 2>&1; then
+      PASSWORD_SECRET="$(openssl rand -base64 96 | tr -d '\n')"
+    else
+      PASSWORD_SECRET="$(head -c 96 /dev/urandom | base64 | tr -d '\n')"
+    fi
+  fi
+  file_set_kv "$conf" "password_secret" "$PASSWORD_SECRET"
+
+  # Admin: admin/admin and basics
+  file_set_kv "$conf" "root_password_sha2" "$ADMIN_SHA256"
+  file_set_kv "$conf" "is_master" "true"
+  file_set_kv "$conf" "root_email" "admin@example.org"
+  file_set_kv "$conf" "root_timezone" "UTC"
+  file_set_kv "$conf" "http_bind_address" "0.0.0.0:9000"
+  file_set_kv "$conf" "http_publish_uri" "http://127.0.0.1:9000/"
+
+  # Don’t point to external OpenSearch when using Data Node
+  sed -i 's/^\s*\(elasticsearch_hosts\|opensearch_hosts\)\s*=.*$/# &/' "$conf" || true
+
+  run systemctl daemon-reload
+  run systemctl enable graylog-server.service
 }
 
-set_permissions() {
-  log "Setting correct ownership for Graylog configuration..."
-  # The 'graylog' user and group are created by the package installation
-  chown -R graylog:graylog /etc/graylog/
-}
-
+# ---------------- Graylog Data Node config ----------------
 configure_datanode() {
-  local f="/etc/graylog/datanode/datanode.conf"
-  log "Configuring Graylog Data Node: $f"
+  local conf="/etc/graylog/datanode/datanode.conf"
+  log "Configuring graylog-datanode: $conf"
   mkdir -p /etc/graylog/datanode
-  touch "$f"
+  [[ -f "$conf" ]] || : > "$conf"
+  cp -a "$conf" "${conf}.bak.$(date +%s)" || true
 
-  # Ensure minimal required keys exist or are updated
-  grep -q '^bind_address' "$f" 2>/dev/null || echo "bind_address = 0.0.0.0" >> "$f"
-  grep -q '^cluster.name' "$f" 2>/dev/null || echo "cluster.name = graylog" >> "$f"
-  grep -q '^node.name' "$f" 2>/dev/null || echo "node.name = ${HOSTNAME}-datanode" >> "$f"
-  grep -q '^http.port' "$f" 2>/dev/null || echo "http.port = 9200" >> "$f"
+  local ip; ip="$(get_host_ip)"
 
-  # For simple, all-in-one setups, disabling the security plugin simplifies installation
-  # by removing the need for TLS certificates and auto-generated passwords.
-  grep -q '^plugins.security.disabled' "$f" 2>/dev/null || echo "plugins.security.disabled = true" >> "$f"
+  # Required ports/binds + shared secret + Mongo
+  file_set_kv "$conf" "bind_address" "0.0.0.0"
+  file_set_kv "$conf" "datanode_http_port" "8999"
+  file_set_kv "$conf" "http_publish_uri" "http://${ip}:8999/"
+  file_set_kv "$conf" "opensearch_http_port" "9200"
+  file_set_kv "$conf" "opensearch_transport_port" "9300"
+  file_set_kv "$conf" "opensearch_network_host" "0.0.0.0"
+  file_set_kv "$conf" "mongodb_uri" "mongodb://127.0.0.1:27017/graylog"
+  file_set_kv "$conf" "password_secret" "$PASSWORD_SECRET"
 
-  # password_secret (MUST match graylog-server)
-  if grep -q '^password_secret\s*=' "$f"; then
-    sed -i "s|^password_secret\s*=.*|password_secret = ${PASSWORD_SECRET}|" "$f"
-  else
-    echo "password_secret = ${PASSWORD_SECRET}" >> "$f"
+  # Optional lab-only: bypass preflight wizard
+  if [[ "${SKIP_PREFLIGHT,,}" == "true" ]]; then
+    file_set_kv "$conf" "skip_preflight_checks" "true"
   fi
 
-  # Heap: half RAM up to 8g if not set
-  if ! grep -q '^opensearch_heap' "$f" 2>/dev/null; then
-    # simple heuristic: half of MemTotal in GiB capped to 8g
-    if command -v awk >/dev/null && [[ -r /proc/meminfo ]]; then
-      mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+  # Heap heuristic (cap 8g)
+  if ! grep -q '^opensearch_heap' "$conf" 2>/dev/null; then
+    if [[ -r /proc/meminfo ]]; then
+      local mem_kb half_gb
+      mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
       half_gb=$(( (mem_kb/1024/1024)/2 ))
       [[ $half_gb -lt 1 ]] && half_gb=1
       [[ $half_gb -gt 8 ]] && half_gb=8
-      log "Setting OpenSearch heap size to ${half_gb}g"
-      echo "opensearch_heap = ${half_gb}g" >> "$f"
+      echo "opensearch_heap = ${half_gb}g" >> "$conf"
     else
-      warn "Cannot determine memory size, setting OpenSearch heap to 2g"
-      echo "opensearch_heap = 2g" >> "$f"
+      echo "opensearch_heap = 2g" >> "$conf"
     fi
   fi
 
-  # MongoDB URI (Data Node needs it)
-  if ! grep -q '^mongodb_uri' "$f" 2>/dev/null; then
-    echo "mongodb_uri = mongodb://127.0.0.1:27017/graylog" >> "$f"
-  fi
-}
+  # Kernel and systemd prerequisites for OpenSearch
+  echo 'vm.max_map_count=262144' > /etc/sysctl.d/99-graylog.conf
+  run sysctl --system
 
-wait_for_datanode() {
-  log "Waiting for Data Node (OpenSearch) to become healthy..."
-  local timeout=180 # 3 minutes
-  local start_time=$(date +%s)
-  while true; do
-    if curl -fsS "http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=10s" > /dev/null; then
-      log "Data Node is up and running."
-      break
-    fi
-    local current_time=$(date +%s)
-    local elapsed=$((current_time - start_time))
-    if [[ $elapsed -ge $timeout ]]; then
-      err "Data Node failed to start within the timeout period."
-      err "Check logs with: journalctl -u graylog-datanode"
-      exit 5
-    fi
-    echo -n "."
-    sleep 5
+  mkdir -p /etc/systemd/system/graylog-datanode.service.d
+  cat > /etc/systemd/system/graylog-datanode.service.d/override.conf <<'EOF'
+[Service]
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+EOF
+
+  run systemctl daemon-reload
+  run systemctl enable graylog-datanode.service
+
+  # Ensure dirs & ownership
+  mkdir -p /var/lib/graylog-datanode /var/log/graylog-datanode
+  for u in graylog graylog-datanode; do
+    id "$u" >/dev/null 2>&1 && run chown -R "$u":"$u" /var/lib/graylog-datanode /var/log/graylog-datanode
   done
-  echo
 }
 
-
-configure_server() {
-  local f="/etc/graylog/server/server.conf"
-  log "Configuring Graylog Server: $f"
-  mkdir -p /etc/graylog/server
-  # Check if config exists, if not, copy the default one
-  if [[ ! -f "$f" ]] && [[ -f "/usr/share/graylog-server/server.conf.example" ]]; then
-     cp /usr/share/graylog-server/server.conf.example "$f"
-  fi
-  touch "$f"
-
-  # password_secret
-  if grep -q '^password_secret\s*=' "$f"; then
-    sed -i "s|^password_secret\s*=.*|password_secret = ${PASSWORD_SECRET}|" "$f"
-  else
-    echo "password_secret = ${PASSWORD_SECRET}" >> "$f"
-  fi
-
-  # root_password_sha2 (admin / admin)
-  if grep -q '^root_password_sha2\s*=' "$f"; then
-    sed -i "s|^root_password_sha2\s*=.*|root_password_sha2 = ${ADMIN_SHA256}|" "$f"
-  else
-    echo "root_password_sha2 = ${ADMIN_SHA256}" >> "$f"
-  fi
-
-  # Basic, sane defaults (idempotent appends)
-  sed -i "s|^#\?root_email\s*=.*|root_email = admin@example.org|" "$f"
-  sed -i "s|^#\?root_timezone\s*=.*|root_timezone = UTC|" "$f"
-
-  # HTTP bind/open to all; publish local (adjust as needed)
-  if grep -q '^http_bind_address\s*=' "$f"; then
-    sed -i "s|^http_bind_address\s*=.*|http_bind_address = 0.0.0.0:9000|" "$f"
-  else
-    echo "http_bind_address = 0.0.0.0:9000" >> "$f"
-  fi
-  # Setting http_publish_uri is important for Graylog to build correct URLs
-  # You might need to change this to your server's public IP or domain name
-  local host_ip
-  host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [[ -z "${host_ip}" ]] && host_ip="127.0.0.1"
-  if grep -q '^http_publish_uri\s*=' "$f"; then
-    sed -i "s|^http_publish_uri\s*=.*|http_publish_uri = http://${host_ip}:9000/|" "$f"
-  else
-    echo "http_publish_uri = http://${host_ip}:9000/" >> "$f"
-  fi
-
-  # With Data Node, do NOT set opensearch/elasticsearch hosts here (auto-managed).
-  # If you previously had elastic/opensearch hosts configured, comment them out:
-  sed -i 's/^\s*\(elasticsearch_hosts\|opensearch_hosts\)\s*=.*$/# &/' "$f" || true
-}
-
+# ---------------- Firewall (best-effort) ----------------
 open_firewall() {
-  log "Opening firewall ports 9000/tcp (UI) and 1514/tcp+udp (Syslog Input)..."
   if command -v ufw >/dev/null 2>&1; then
-    ufw allow 9000/tcp || true
-    ufw allow 1514/tcp || true
-    ufw allow 1514/udp || true
+    run ufw allow 9000/tcp
+    run ufw allow 1514/tcp
+    run ufw allow 1514/udp
   fi
   if command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --add-port=9000/tcp --permanent || true
-    firewall-cmd --add-port=1514/tcp --permanent || true
-    firewall-cmd --add-port=1514/udp --permanent || true
-    firewall-cmd --reload || true
+    run firewall-cmd --add-port=9000/tcp --permanent
+    run firewall-cmd --add-port=1514/tcp --permanent
+    run firewall-cmd --add-port=1514/udp --permanent
+    run firewall-cmd --reload
   fi
 }
 
-post_checks() {
-  log "Services status (showing brief):"
-  systemctl --no-pager --full status mongod | sed -n '1,5p' || true
-  systemctl --no-pager --full status graylog-datanode | sed -n '1,5p' || true
-  systemctl --no-pager --full status graylog-server | sed -n '1,10p' || true
-
-  HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [[ -z "${HOST_IP}" ]] && HOST_IP="127.0.0.1"
-
-  echo
-  echo "========================================================="
-  echo " Graylog is (re)starting — first boot may take ~1–3 mins."
-  echo
-  echo " UI:       http://${HOST_IP}:9000/"
-  echo " Login:    admin / admin   (CHANGE THIS ASAP)"
-  echo "========================================================="
+# ---------------- Wait helpers (non-fatal) ----------------
+wait_for_port() {
+  local port="$1" timeout="${2:-420}"
+  log "Waiting for TCP :$port (timeout ${timeout}s)…"
+  for ((i=0;i<timeout;i++)); do
+    ss -ltn 2>/dev/null | grep -q ":${port} " && { log "Port :$port is listening."; return 0; }
+    sleep 1
+  done
+  warn "Timeout waiting for port :$port"
+  ERROR_COUNT=$((ERROR_COUNT+1))
+  return 0
 }
 
-# ---------- Execute ----------
-set_kernel_params
+dump_brief_logs() {
+  echo "----- journalctl graylog-datanode (tail) -----"
+  journalctl -u graylog-datanode -n 80 --no-pager 2>/dev/null || true
+  echo "----- datanode.log (tail) -----"
+  tail -n 120 /var/log/graylog-datanode/datanode.log 2>/dev/null || true
+  echo "----- opensearch.log (tail) -----"
+  tail -n 120 /var/log/graylog-datanode/opensearch.log 2>/dev/null || true
+  echo "----- server.log (preflight creds, if any) -----"
+  grep -iE 'preflight|temporary|credential|username|password' /var/log/graylog-server/server.log 2>/dev/null | tail -n 40 || true
+}
 
+# ---------------- Execute ----------------
 if [[ "$PM" == "apt" ]]; then
   log "Using APT flow"
   install_mongodb_apt
   install_graylog_stack_apt
-elif [[ "$PM" == "dnf" ]]; then
+else
   log "Using DNF flow"
   install_mongodb_rpm
   install_graylog_stack_rpm
 fi
 
-# 0. Clean up any previous failed attempts
-cleanup_previous_install
-
-# 1. Configure files
+configure_graylog_server
 configure_datanode
-configure_server
-
-# 2. Set correct permissions
-set_permissions
-
-# 3. Start services in order
-systemctl daemon-reload
-systemctl enable graylog-datanode.service graylog-server.service
-
-log "Starting Graylog Data Node..."
-systemctl restart graylog-datanode.service
-
-# 4. Wait for datanode to be healthy before starting server
-wait_for_datanode
-
-log "Starting Graylog Server..."
-systemctl restart graylog-server.service
-
 open_firewall
-post_checks
 
-log "Done."
+# Start/restart (non-fatal)
+run systemctl restart graylog-datanode
+run systemctl restart graylog-server
 
+# Wait for listeners (non-fatal)
+wait_for_port 8999 420   # Data Node REST
+wait_for_port 9200 420   # OpenSearch REST (can take longer first boot)
+wait_for_port 9000 300   # Graylog UI
 
+# Dump tails if any warnings happened
+if [[ $ERROR_COUNT -gt 0 ]]; then
+  dump_brief_logs
+fi
+
+# ---------------- Summary ----------------
+HOST_IP="$(get_host_ip)"
+log "Services status (brief):"
+run systemctl --no-pager --full status mongod | sed -n '1,6p'
+run systemctl --no-pager --full status graylog-datanode | sed -n '1,8p'
+run systemctl --no-pager --full status graylog-server | sed -n '1,10p'
+
+cat <<EOF
+
+=========================================================
+ Graylog install/upgrade finished (with ${ERROR_COUNT} warning(s)).
+
+ UI:        http://${HOST_IP}:9000/
+ Login:     admin / admin   (CHANGE IMMEDIATELY)
+ Logs:      ${LOG_FILE}
+
+ Notes:
+ - If a browser Basic-Auth pops up on first visit, use the temporary
+   preflight credentials from server.log, finish the wizard, then
+   log in with admin/admin.
+ - If :9200 didn't come up in time, Data Node may still be initialising.
+   Check log tails above in ${LOG_FILE}.
+=========================================================
+
+EOF
+
+# Always exit 0 for Terraform
+exit 0
