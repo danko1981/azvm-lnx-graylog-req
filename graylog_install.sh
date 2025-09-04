@@ -48,7 +48,7 @@ MONGO_MAJOR_RHEL="8.0"                       # fallback to 7.0 if needed
 ADMIN_SHA256="$(printf '%s' admin | sha256sum | awk '{print $1}')"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
 
-# Threshold: 128 GiB in bytes
+# Threshold: 128 GiB in bytes: minimum size of the disk to be attached and used as graylog datastorage.
 THRESHOLD_BYTES=$((128 * 1024 * 1024 * 1024))
 
 # ---------------- Helpers ----------------
