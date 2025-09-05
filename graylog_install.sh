@@ -3,7 +3,7 @@
 # + Optional data disk auto-setup -> /gldata for indexes
 # Ubuntu 22.04/24.04 or RHEL 8/9
 # Terraform-friendly: logs to /var/log/server_install.log and ALWAYS exits 0
-
+#
 set -uo pipefail
 
 # ---------------- Logging ----------------
